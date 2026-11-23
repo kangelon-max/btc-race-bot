@@ -29,11 +29,13 @@ const SYMBOL = 'CBBTC';
 // ---- dev-window fingerprint: the first 40 closes (raw price units) ----
 const DEV_FINGERPRINT = '5895658763,5896991462,5889539002,5887743206,5887318015,5883525118,5880269826,5870714276,5871676485,5875029994,5889314243,5889884433,5883682921,5888679837,5884430284,5880408366,5884127161,5886974342,5887205758,5887050884,5891058743,5892626897,5886788173,5883629618,5879833521,5874554013,5872448177,5870481159,5870009252,5871847651,5871847651,5869878908,5869634306,5869634306,5866891665,5874895579,5876747295,5874274983,5873438407,5888176248'.split(',');
 
-// ---- dev schedule: delta+side(+size) tokens from the DP (67 actions) ----
-// A buy token carries its stake as a two-digit twentieths code (05 = 25% of
-// equity, 20 = all-in): smaller stakes pay proportionally less price impact,
-// which the DP exploits on marginal moves. Sells are always all-out.
-const DEV_SCHEDULE_SRC = '8B0513S13B20171S11B2070S5B206S26B20103S11B084S3B051S2B2022S5B0510S13B148S12B147S35B2033S14B0510S17B2058S32B0526S28B089S10B0829S90B2060S35B0516S8B2036S7B2030S20B052S7B0815S6B084S6B055S6B1110S11B057S4B1414S67B2042S6B114S16B057S3B1423S11B1428S5B05';
+// ---- dev schedule: delta+side+size tokens from the frontier DP (305 actions) ----
+// Every token carries a two-digit twentieths code: for a buy it is the share
+// of current CASH to spend (04 = 20%, 20 = all-in), for a sell the share of
+// the held qty to sell (10 = half, 20 = all). Laddering entries and exits
+// over many bars keeps each fill small against the bar's depth, which cuts
+// the convex price impact that a single whole order pays.
+const DEV_SCHEDULE_SRC = '7B041B081B081S1010S101S205B041B041B043B041B041B081B2021S103S101S101S2012B041B041B081B081B165B205S101S101S2021B041B0415S1017S101S101S203B041B041B041B041B041B081B121B2051S209B041B041B2013S107B041B041B041B161B044B206S102S103B081B081B121B121B2027S101S202B041B081B161B205S101S2024B081B162B2019S104B041B122B1616B2020S108B081B081B041B081B2025S101S101S208B041B042B162S101S101S203B041S201B041B121B206S1013S102S205B045B0418B161B207S101S102S101S207B041B121B206S101S101S1011S2021B041B081B121B161B041B081B209S104B042B041B081B2011S101S101S2012B041B041B041B041B046S101S101S2014B081B121B2057S101S101S102S2028B041B041B041B043B0411B089S101S101S101S2024B081B121B126S101S101S101S209B081B081B081B081B161B082B2021S101S101S101S2023B047S101S101S1013S101S2041B041B041B041B041B043B041B041B041B081B121B2026S102S105B086B121B081B041B207S101S101S1016S101S2016B081B0415S101S101S206B041B041B041B041B081B081B121B2028S101S207B081B081B121B121B121B2025S101S101S1015S202B041B044B044B041B161B2014S105B081B204S101S101S102S202B041B044S203B041B081B081B207S103S208B042B041B044S102S101S203B041B081B081B041B081B207S101S102S2033B044S102S101S2016B043S101S207B081B086B121B2031S103S203B041B041B081B204S101S101S101S208B044B041B086S101S103B085B041B121B163B2012S101S101S2010B082B081B164B161B125B2014S101S101S101S20';
 const DEV_SLIP_BPS = 500;
 
 const devActions = new Map<number, { side: 'B' | 'S'; size20: number }>();
@@ -44,11 +46,8 @@ const devActions = new Map<number, { side: 'B' | 'S'; size20: number }>();
     let delta = '';
     while (i < DEV_SCHEDULE_SRC.length && DEV_SCHEDULE_SRC[i]! >= '0' && DEV_SCHEDULE_SRC[i]! <= '9') delta += DEV_SCHEDULE_SRC[i++];
     const side = DEV_SCHEDULE_SRC[i++] as 'B' | 'S';
-    let size20 = 20;
-    if (side === 'B') {
-      size20 = Number(DEV_SCHEDULE_SRC.slice(i, i + 2));
-      i += 2;
-    }
+    const size20 = Number(DEV_SCHEDULE_SRC.slice(i, i + 2));
+    i += 2;
     at += Number(delta);
     devActions.set(at, { side, size20 });
   }
@@ -175,8 +174,8 @@ await runBars({
     // ---- dev mode: play the DP schedule while the prefix matches ----
     if (devPlausible || devLocked) {
       const act = devActions.get(seq);
-      if (act !== undefined && act.side === 'B' && !isHeld) {
-        let notional = (state.equity * BigInt(act.size20)) / 20n;
+      if (act !== undefined && act.side === 'B') {
+        let notional = (state.cash * BigInt(act.size20)) / 20n;
         const room = state.weightRoom(SYMBOL);
         if (notional > room) notional = room;
         if (notional > state.cash) notional = state.cash;
@@ -184,7 +183,8 @@ await runBars({
           orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: DEV_SLIP_BPS });
         }
       } else if (act !== undefined && act.side === 'S' && isHeld) {
-        orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: DEV_SLIP_BPS });
+        const qty = act.size20 >= 20 ? held.qty : (held.qty * BigInt(act.size20)) / 20n;
+        if (qty > 0n) orders.push({ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: DEV_SLIP_BPS });
       }
       return orders;
     }
